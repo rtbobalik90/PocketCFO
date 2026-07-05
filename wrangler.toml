@@ -1,0 +1,90 @@
+/* =========================================================
+   Pocket CFO — coach.js
+   AI Financial Coach.
+   - If a backend URL is configured (Cloudflare Worker), chat
+     goes to POST {backend}/api/coach — the Claude API key
+     lives ONLY on the server.
+   - With no backend, a local rules-based coach analyzes the
+     same financial summary so the app is useful on day one.
+   ========================================================= */
+(function () {
+  const S = () => window.Store;
+
+  async function ask(userMessage) {
+    const backend = S().state.settings.backendUrl.trim().replace(/\/$/, '');
+    const summary = S().financialSummary();
+    const history = S().state.coachHistory.slice(-12); // keep context small
+
+    if (backend) {
+      const res = await fetch(backend + '/api/coach', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary, messages: [...history, { role: 'user', content: userMessage }] })
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Coach backend error ${res.status}: ${text.slice(0, 200)}`);
+      }
+      const data = await res.json();
+      return data.reply;
+    }
+    return localCoach(userMessage, summary);
+  }
+
+  /* ---------- local fallback coach ---------- */
+  function localCoach(msg, sum) {
+    const fmt = S().fmt;
+    const m = msg.toLowerCase();
+    const cur = sum.months[sum.months.length - 1] || { income: 0, spend: 0, byCategory: {} };
+    const debtTotal = sum.debts.reduce((s, d) => s + d.balance, 0);
+    const minSum = sum.debts.reduce((s, d) => s + d.minPayment, 0);
+    const worst = [...sum.debts].sort((a, b) => b.apr - a.apr)[0];
+    const subs = sum.recurring.reduce((s, r) => s + r.monthlyCost, 0);
+
+    const lines = [];
+
+    if (m.includes('debt') || m.includes('pay off') || m.includes('payoff')) {
+      if (!sum.debts.length) return "You haven't added any debts yet. Add them in the Debt tab (balance, APR, minimum payment) and I'll build you a payoff order.";
+      lines.push(`You owe ${fmt(debtTotal)} across ${sum.debts.length} debts, with ${fmt(minSum)}/mo in minimums.`);
+      if (worst) lines.push(`${worst.name} at ${worst.apr}% APR is the fire — it costs ~${fmt(worst.balance * worst.apr / 1200)}/mo in interest. Every spare dollar goes there first (avalanche).`);
+      if (sum.safeToSave > 0) lines.push(`Your cash flow supports roughly ${fmt(sum.safeToSave)}/mo extra. Set that in the Debt tab and look at the timeline — seeing the finish date is half the motivation.`);
+      lines.push(`One rule: no new debt while paying off old debt. A paid-off card that gets re-loaded is a treadmill, not progress.`);
+      return lines.join('\n\n');
+    }
+
+    if (m.includes('save') || m.includes('saving') || m.includes('emergency')) {
+      const ef = sum.goals.find(g => g.isEmergency);
+      if (ef && ef.saved < cur.spend) lines.push(`Priority: your emergency fund (${fmt(ef.saved)}) covers less than one month of spending (${fmt(cur.spend)}). Get it to one month before anything optional.`);
+      lines.push(`Based on your last few months, you can safely put away about ${fmt(sum.safeToSave)}/mo without a perfect-month budget.`);
+      if (worst && worst.apr >= 15) lines.push(`Caveat: with ${worst.name} at ${worst.apr}%, keep the emergency fund at one month of expenses, then throw everything else at that debt. Saving at 4% while paying ${worst.apr}% is losing money politely.`);
+      return lines.join('\n\n');
+    }
+
+    if (m.includes('subscription') || m.includes('recurring')) {
+      if (!sum.recurring.length) return "I don't see recurring charges yet — I need at least two months of transactions to detect them.";
+      lines.push(`I found ${sum.recurring.length} recurring charges totaling ~${fmt(subs)}/mo (${fmt(subs * 12)}/yr):`);
+      lines.push(sum.recurring.map(r => `• ${r.merchant}: ${fmt(r.monthlyCost)}/mo`).join('\n'));
+      lines.push(`Cancel anything you wouldn't re-buy today at full price.`);
+      return lines.join('\n\n');
+    }
+
+    if (m.includes('spend') || m.includes('budget') || m.includes('where')) {
+      const cats = Object.entries(cur.byCategory).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      lines.push(`This month: ${fmt(cur.income)} in, ${fmt(cur.spend)} out (${cur.income - cur.spend >= 0 ? '+' : ''}${fmt(cur.income - cur.spend)}).`);
+      if (cats.length) lines.push(`Top spending:\n` + cats.map(([c, v]) => `• ${c}: ${fmt(v)}`).join('\n'));
+      lines.push(cur.spend > cur.income ? `You're spending more than you earn. That gap is the only problem worth solving this month.` : `You're cash-flow positive. Now direct the surplus on purpose instead of letting it evaporate.`);
+      return lines.join('\n\n');
+    }
+
+    // default: general assessment
+    lines.push(`Here's the honest picture:`);
+    lines.push(`• Cash: ${fmt(sum.cashPosition)} · Net worth: ${fmt(sum.netWorth.net)}`);
+    lines.push(`• This month: ${fmt(cur.income)} in / ${fmt(cur.spend)} out`);
+    if (sum.debts.length) lines.push(`• Debt: ${fmt(debtTotal)} total${worst ? `, worst APR ${worst.apr}% (${worst.name})` : ''}`);
+    if (subs > 0) lines.push(`• Recurring charges: ~${fmt(subs)}/mo`);
+    lines.push(`\nAsk me about your **debt**, **savings**, **spending**, or **subscriptions**. (Connect a backend in Settings to unlock the full AI coach.)`);
+    return lines.join('\n');
+  }
+
+  window.Coach = { ask };
+})();
